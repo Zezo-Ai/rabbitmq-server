@@ -109,12 +109,17 @@ declare(Q0, _Node) ->
              boolean(),
              boolean(),
              rabbit_types:username()) ->
-    rabbit_types:ok(non_neg_integer()).
+    rabbit_types:ok(non_neg_integer()) |
+    rabbit_types:error(timeout).
 delete(Q, _IfUnused, _IfEmpty, ActingUser) ->
     QName = amqqueue:get_name(Q),
     log_delete(QName, amqqueue:get_exclusive_owner(Q)),
-    ok = rabbit_amqqueue:internal_delete(Q, ActingUser),
-    {ok, 0}.
+    case rabbit_amqqueue:internal_delete(Q, ActingUser) of
+        ok ->
+            {ok, 0};
+        {error, timeout} = Err ->
+            Err
+    end.
 
 -spec deliver([{amqqueue:amqqueue(), stateless}],
               Msg :: mc:state(),

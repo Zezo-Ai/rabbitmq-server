@@ -30,6 +30,12 @@
        }}
    }).
 
+-rabbit_deprecated_feature(
+   {amqp_filter_set_bug,
+    #{deprecation_phase => permitted_by_default,
+      doc_url => "https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-messaging-v1.0-os.html#type-filter-set"
+     }}).
+
 %% This is the link credit that we grant to sending clients.
 %% We are free to choose whatever we want, sending clients must obey.
 %% Default soft limits / credits in deps/rabbit/Makefile are:
@@ -140,6 +146,7 @@
          }).
 
 -record(incoming_link, {
+          snd_settle_mode :: snd_settle_mode(),
           %% The exchange is either defined in the ATTACH frame and static for
           %% the life time of the link or dynamically provided in each message's
           %% "to" field (address v2).
@@ -500,15 +507,10 @@ handle_cast({frame_body, FrameBody},
             #state{cfg = #cfg{writer_pid = WriterPid,
                               channel_num = Ch}} = State0) ->
     try handle_frame(FrameBody, State0) of
-        {reply, Replies, State} when is_list(Replies) ->
-            lists:foreach(fun (Reply) ->
-                                  rabbit_amqp_writer:send_command(WriterPid, Ch, Reply)
-                          end, Replies),
-            noreply(State);
-        {reply, Reply, State} ->
-            rabbit_amqp_writer:send_command(WriterPid, Ch, Reply),
-            noreply(State);
-        {noreply, State} ->
+        {ok, ReplyFrames, State} ->
+            lists:foreach(fun(Frame) ->
+                                  rabbit_amqp_writer:send_command(WriterPid, Ch, Frame)
+                          end, ReplyFrames),
             noreply(State);
         {stop, _, _} = Stop ->
             Stop
@@ -913,7 +915,7 @@ handle_frame({Performative = #'v1_0.transfer'{handle = ?UINT(Handle)}, Paylaod},
         _ ->
             incoming_mgmt_link_transfer(Performative, Paylaod, State1)
     end,
-    reply0(Reply ++ Flows, State);
+    reply_frames(Reply ++ Flows, State);
 
 %% Although the AMQP message format [3.2] requires a body, it is valid to send a transfer frame without payload.
 %% For example, when a large multi transfer message is streamed using the ProtonJ2 client, the client could send
@@ -962,7 +964,7 @@ handle_frame(#'v1_0.flow'{handle = Handle} = Flow,
                         end
                 end
         end,
-    {noreply, S};
+    reply_frames([], S);
 
 handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                                  first = ?UINT(First),
@@ -981,7 +983,7 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
     UnsettledMapSize = map_size(UnsettledMap0),
     case UnsettledMapSize of
         0 ->
-            {noreply, State0};
+            reply_frames([], State0);
         _ ->
             DispositionRangeSize = diff(Last, First) + 1,
             {Settled, UnsettledMap} =
@@ -1041,7 +1043,7 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                                                                  role = ?AMQP_ROLE_SENDER}]
                     end,
             State = handle_queue_actions(Actions, State1),
-            reply0(Reply, State)
+            reply_frames(Reply, State)
     end;
 
 handle_frame(#'v1_0.attach'{handle = ?UINT(Handle)} = Attach,
@@ -1095,9 +1097,9 @@ handle_frame(Detach = #'v1_0.detach'{handle = ?UINT(HandleInt)},
                           outgoing_pending = Pending,
                           queue_states = QStates},
     State = maybe_detach_mgmt_link(HandleInt, State1),
-    maybe_detach_reply(Detach, State, State0),
+    Reply = detach_reply(Detach, State, State0),
     publisher_or_consumer_deleted(State, State0),
-    {noreply, State};
+    reply_frames(Reply, State);
 
 handle_frame(#'v1_0.end'{},
              State0 = #state{cfg = #cfg{writer_pid = WriterPid,
@@ -1117,6 +1119,9 @@ handle_frame(Frame, _State) ->
     protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
                    "Unexpected frame ~tp",
                    [amqp10_framing:pprint(Frame)]).
+
+reply_frames(Frames, State) ->
+    {ok, session_flow_fields(Frames, State), State}.
 
 handle_attach(#'v1_0.attach'{
                 role = ?AMQP_ROLE_SENDER,
@@ -1173,7 +1178,7 @@ handle_attach(#'v1_0.attach'{
     Flow = #'v1_0.flow'{handle = Handle,
                         delivery_count = DeliveryCount,
                         link_credit = ?UINT(?MAX_MANAGEMENT_LINK_CREDIT)},
-    reply0([Reply, Flow], State);
+    reply_frames([Reply, Flow], State);
 
 handle_attach(#'v1_0.attach'{
                 role = ?AMQP_ROLE_RECEIVER,
@@ -1228,13 +1233,13 @@ handle_attach(#'v1_0.attach'{
                %% Echo back that we will respect the client's requested max-message-size.
                max_message_size = MaybeMaxMessageSize,
                properties = Properties},
-    reply0(Reply, State);
+    reply_frames([Reply], State);
 
 handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
                              name = LinkName,
                              handle = Handle = ?UINT(HandleInt),
                              source = Source,
-                             snd_settle_mode = SndSettleMode,
+                             snd_settle_mode = MaybeSndSettleMode,
                              target = Target,
                              initial_delivery_count = DeliveryCount = ?UINT(DeliveryCountInt)
                             },
@@ -1245,8 +1250,10 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
                                          user = User}}) ->
     case ensure_target(Target, Vhost, User, PermCache0) of
         {ok, Exchange, RoutingKey, QNameBin, PermCache} ->
+            SndSettleMode = snd_settle_mode(MaybeSndSettleMode),
             MaxMessageSize = persistent_term:get(max_message_size),
             IncomingLink = #incoming_link{
+                              snd_settle_mode = SndSettleMode,
                               exchange = Exchange,
                               routing_key = RoutingKey,
                               queue_name_bin = QNameBin,
@@ -1258,7 +1265,7 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
                        name = LinkName,
                        handle = Handle,
                        source = Source,
-                       snd_settle_mode = SndSettleMode,
+                       snd_settle_mode = MaybeSndSettleMode,
                        rcv_settle_mode = ?V_1_0_RECEIVER_SETTLE_MODE_FIRST,
                        target = Target,
                        %% We are the receiver.
@@ -1275,7 +1282,7 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
             State = State0#state{incoming_links = IncomingLinks,
                                  permission_cache = PermCache},
             rabbit_global_counters:publisher_created(?PROTOCOL),
-            reply0([Reply, Flow], State);
+            reply_frames([Reply, Flow], State);
         {error, Reason} ->
             protocol_error(?V_1_0_AMQP_ERROR_INVALID_FIELD,
                            "Attach rejected: ~tp",
@@ -1283,12 +1290,13 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
     end;
 
 handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
-                            name = LinkName,
-                            handle = Handle = ?UINT(HandleInt),
-                            source = Source,
-                            snd_settle_mode = SndSettleMode,
-                            rcv_settle_mode = RcvSettleMode,
-                            max_message_size = MaybeMaxMessageSize} = Attach,
+                             name = LinkName,
+                             handle = Handle = ?UINT(HandleInt),
+                             source = Source = #'v1_0.source'{filter = DesiredFilter},
+                             snd_settle_mode = SndSettleMode,
+                             rcv_settle_mode = RcvSettleMode,
+                             max_message_size = MaybeMaxMessageSize,
+                             properties = Properties},
              State0 = #state{queue_states = QStates0,
                              outgoing_links = OutgoingLinks0,
                              permission_cache = PermCache0,
@@ -1358,6 +1366,10 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
                                     credit_api_v1,
                                     credit_api_v1}
                            end,
+                           ConsumerArgs0 = parse_attach_properties(Properties),
+                           {EffectiveFilter, ConsumerFilter, ConsumerArgs1} =
+                           parse_filter(DesiredFilter),
+                           ConsumerArgs = ConsumerArgs0 ++ ConsumerArgs1,
                            Spec = #{no_ack => SndSettled,
                                     channel_pid => self(),
                                     limiter_pid => none,
@@ -1365,11 +1377,14 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
                                     mode => Mode,
                                     consumer_tag => handle_to_ctag(HandleInt),
                                     exclusive_consume => false,
-                                    args => consumer_arguments(Attach),
+                                    args => ConsumerArgs,
+                                    filter => ConsumerFilter,
                                     ok_msg => undefined,
                                     acting_user => Username},
                            case rabbit_queue_type:consume(Q, Spec, QStates0) of
                                {ok, QStates} ->
+                                   OfferedCaps0 = rabbit_queue_type:amqp_capabilities(QType),
+                                   OfferedCaps = rabbit_amqp_util:capabilities(OfferedCaps0),
                                    A = #'v1_0.attach'{
                                           name = LinkName,
                                           handle = Handle,
@@ -1381,10 +1396,13 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
                                           %% will be requeued. That's why the we only support RELEASED as the default outcome.
                                           source = Source#'v1_0.source'{
                                                             default_outcome = #'v1_0.released'{},
-                                                            outcomes = outcomes(Source)},
+                                                            outcomes = outcomes(Source),
+                                                            %% "the sending endpoint sets the filter actually in place" [3.5.3]
+                                                            filter = EffectiveFilter},
                                           role = ?AMQP_ROLE_SENDER,
                                           %% Echo back that we will respect the client's requested max-message-size.
-                                          max_message_size = MaybeMaxMessageSize},
+                                          max_message_size = MaybeMaxMessageSize,
+                                          offered_capabilities = OfferedCaps},
                                    MaxMessageSize = max_message_size(MaybeMaxMessageSize),
                                    Link = #outgoing_link{
                                              queue_name = queue_resource(Vhost, QNameBin),
@@ -1416,7 +1434,7 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
                            end
                    end) of
                 {ok, Reply, State} ->
-                    reply0(Reply, State);
+                    reply_frames(Reply, State);
                 {error, Reason} ->
                     protocol_error(
                       ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
@@ -1842,11 +1860,6 @@ record_outgoing_unsettled(#pending_delivery{queue_ack_required = false}, State) 
     %% Also, queue client already acked to queue on behalf of us.
     State.
 
-reply0([], State) ->
-    {noreply, State};
-reply0(Reply, State) ->
-    {reply, session_flow_fields(Reply, State), State}.
-
 %% Implements section "receiving a transfer" in 2.5.6
 session_flow_control_received_transfer(
   #state{next_incoming_id = NextIncomingId,
@@ -1919,13 +1932,15 @@ settle_op_from_outcome(#'v1_0.modified'{delivery_failed = DelFailed,
                                         undeliverable_here = UndelHere,
                                         message_annotations = Anns0}) ->
     Anns = case Anns0 of
-               #'v1_0.message_annotations'{content = C} ->
-                   Anns1 = lists:map(fun({{symbol, K}, V}) ->
-                                             {K, unwrap(V)}
-                                     end, C),
-                   maps:from_list(Anns1);
-               _ ->
-                   #{}
+               undefined ->
+                   #{};
+               {map, KVList} ->
+                   Anns1 = lists:map(
+                             %% "all symbolic keys except those beginning with "x-" are reserved." [3.2.10]
+                             fun({{symbol, <<"x-", _/binary>> = K}, V}) ->
+                                     {K, unwrap(V)}
+                             end, KVList),
+                   maps:from_list(Anns1)
            end,
     {modify,
      default(DelFailed, false),
@@ -2309,7 +2324,8 @@ incoming_link_transfer(
                    rcv_settle_mode = RcvSettleMode,
                    handle = Handle = ?UINT(HandleInt)},
   MsgPart,
-  #incoming_link{exchange = LinkExchange,
+  #incoming_link{snd_settle_mode = SndSettleMode,
+                 exchange = LinkExchange,
                  routing_key = LinkRKey,
                  max_message_size = MaxMessageSize,
                  delivery_count = DeliveryCount0,
@@ -2340,8 +2356,12 @@ incoming_link_transfer(
             ok = validate_multi_transfer_settled(MaybeSettled, FirstSettled),
             {MsgBin0, FirstDeliveryId, FirstSettled}
     end,
+    validate_transfer_snd_settle_mode(SndSettleMode, Settled),
     validate_transfer_rcv_settle_mode(RcvSettleMode, Settled),
-    validate_message_size(PayloadBin, MaxMessageSize),
+    PayloadSize = iolist_size(PayloadBin),
+    validate_message_size(PayloadSize, MaxMessageSize),
+    rabbit_msg_size_metrics:observe(?PROTOCOL, PayloadSize),
+    messages_received(Settled),
 
     Mc0 = mc:init(mc_amqp, PayloadBin, #{}),
     case lookup_target(LinkExchange, LinkRKey, Mc0, Vhost, User, PermCache0) of
@@ -2350,7 +2370,6 @@ incoming_link_transfer(
             check_user_id(Mc2, User),
             TopicPermCache = check_write_permitted_on_topic(
                                X, User, RoutingKey, TopicPermCache0),
-            messages_received(Settled),
             QNames = rabbit_exchange:route(X, Mc2, #{return_binding_keys => true}),
             rabbit_trace:tap_in(Mc2, QNames, ConnName, ChannelNum, Username, Trace),
             Opts = #{correlation => {HandleInt, DeliveryId}},
@@ -2386,9 +2405,34 @@ incoming_link_transfer(
                                    [DeliveryTag, DeliveryId, Reason])
             end;
         {error, #'v1_0.error'{} = Err} ->
-            Disposition = released(DeliveryId),
-            Detach = detach(HandleInt, Link0, Err),
-            {error, [Disposition, Detach]}
+            Disposition = case Settled of
+                              true -> [];
+                              false -> [released(DeliveryId)]
+                          end,
+            Detach = [detach(HandleInt, Link0, Err)],
+            {error, Disposition ++ Detach};
+        {error, anonymous_terminus, #'v1_0.error'{} = Err} ->
+            %% https://docs.oasis-open.org/amqp/anonterm/v1.0/cs01/anonterm-v1.0-cs01.html#doc-routingerrors
+            case Settled of
+                true ->
+                    Info = {map, [{{symbol, <<"delivery-tag">>}, DeliveryTag}]},
+                    Err1 = Err#'v1_0.error'{info = Info},
+                    Detach = detach(HandleInt, Link0, Err1),
+                    {error, [Detach]};
+                false ->
+                    Disposition = rejected(DeliveryId, Err),
+                    DeliveryCount = add(DeliveryCount0, 1),
+                    Credit1 = Credit0 - 1,
+                    {Credit, Reply0} = maybe_grant_link_credit(
+                                         Credit1, MaxLinkCredit,
+                                         DeliveryCount, map_size(U0), Handle),
+                    Reply = [Disposition | Reply0],
+                    Link = Link0#incoming_link{
+                             delivery_count = DeliveryCount,
+                             credit = Credit,
+                             multi_transfer_msg = undefined},
+                    {ok, Reply, Link, State0}
+            end
     end.
 
 lookup_target(#exchange{} = X, LinkRKey, Mc, _, _, PermCache) ->
@@ -2412,16 +2456,16 @@ lookup_target(to, to, Mc, Vhost, User, PermCache0) ->
                             check_internal_exchange(X),
                             lookup_routing_key(X, RKey, Mc, PermCache);
                         {error, not_found} ->
-                            {error, error_not_found(XName)}
+                            {error, anonymous_terminus, error_not_found(XName)}
                     end;
                 {error, bad_address} ->
-                    {error,
+                    {error, anonymous_terminus,
                      #'v1_0.error'{
                         condition = ?V_1_0_AMQP_ERROR_PRECONDITION_FAILED,
                         description = {utf8, <<"bad 'to' address string: ", String/binary>>}}}
             end;
         undefined ->
-            {error,
+            {error, anonymous_terminus,
              #'v1_0.error'{
                 condition = ?V_1_0_AMQP_ERROR_PRECONDITION_FAILED,
                 description = {utf8, <<"anonymous terminus requires 'to' address to be set">>}}}
@@ -2464,6 +2508,12 @@ released(DeliveryId) ->
                         first = ?UINT(DeliveryId),
                         settled = true,
                         state = #'v1_0.released'{}}.
+
+rejected(DeliveryId, Error) ->
+    #'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
+                        first = ?UINT(DeliveryId),
+                        settled = true,
+                        state = #'v1_0.rejected'{error = Error}}.
 
 maybe_grant_link_credit(Credit, MaxLinkCredit, DeliveryCount, NumUnconfirmed, Handle) ->
     case grant_link_credit(Credit, MaxLinkCredit, NumUnconfirmed) of
@@ -2672,11 +2722,10 @@ parse_target_v2_string(String) ->
     end.
 
 parse_target_v2_string0(<<"/exchanges/", Rest/binary>>) ->
-    Key = cp_slash,
-    Pattern = try persistent_term:get(Key)
+    Pattern = try persistent_term:get(cp_slash)
               catch error:badarg ->
                         Cp = binary:compile_pattern(<<"/">>),
-                        ok = persistent_term:put(Key, Cp),
+                        ok = persistent_term:put(cp_slash, Cp),
                         Cp
               end,
     case binary:split(Rest, Pattern, [global]) of
@@ -2917,6 +2966,15 @@ credit_reply_timeout(QType, QName) ->
 default(undefined, Default) -> Default;
 default(Thing,    _Default) -> Thing.
 
+snd_settle_mode({ubyte, Val}) ->
+    case Val of
+        0 -> unsettled;
+        1 -> settled;
+        2 -> mixed
+    end;
+snd_settle_mode(undefined) ->
+    mixed.
+
 transfer_frames(Transfer, Sections, unlimited) ->
     [[Transfer, Sections]];
 transfer_frames(Transfer, Sections, MaxFrameSize) ->
@@ -2938,87 +2996,89 @@ encode_frames(T, Msg, MaxPayloadSize, Transfers) ->
             lists:reverse([[T, Msg] | Transfers])
     end.
 
-consumer_arguments(#'v1_0.attach'{
-                      source = #'v1_0.source'{filter = Filter},
-                      properties = Properties}) ->
-    properties_to_consumer_args(Properties) ++
-    filter_to_consumer_args(Filter).
-
-properties_to_consumer_args({map, KVList}) ->
+parse_attach_properties(undefined) ->
+    [];
+parse_attach_properties({map, KVList}) ->
     Key = {symbol, <<"rabbitmq:priority">>},
     case proplists:lookup(Key, KVList) of
         {Key, Val = {int, _Prio}} ->
             [mc_amqpl:to_091(<<"x-priority">>, Val)];
         _ ->
             []
+    end.
+
+parse_filter(undefined) ->
+    {undefined, [], []};
+parse_filter({map, DesiredKVList}) ->
+    {EffectiveKVList, ConsusumerFilter, ConsumerArgs} =
+    lists:foldr(fun parse_filters/2, {[], [], []}, DesiredKVList),
+    {{map, EffectiveKVList}, ConsusumerFilter, ConsumerArgs}.
+
+parse_filters(Filter = {{symbol, _Key}, {described, {symbol, <<"rabbitmq:stream-offset-spec">>}, Value}},
+              Acc = {EffectiveFilters, ConsumerFilter, ConsumerArgs}) ->
+    case Value of
+        {timestamp, Ts} ->
+            %% 0.9.1 uses second based timestamps
+            Arg = {<<"x-stream-offset">>, timestamp, Ts div 1000},
+            {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
+        {utf8, Spec} ->
+            %% next, last, first and "10m" etc
+            Arg = {<<"x-stream-offset">>, longstr, Spec},
+            {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
+        {_Type, Offset}
+          when is_integer(Offset) andalso Offset >= 0 ->
+            Arg = {<<"x-stream-offset">>, long, Offset},
+            {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
+        _ ->
+            Acc
     end;
-properties_to_consumer_args(_) ->
-    [].
+parse_filters(Filter = {{symbol, _Key}, {described, {symbol, <<"rabbitmq:stream-filter">>}, Value}},
+              Acc = {EffectiveFilters, ConsumerFilter, ConsumerArgs}) ->
+    case Value of
+        {list, Filters0} ->
+            Filters = lists:filtermap(fun({utf8, Filter0}) ->
+                                              {true, {longstr, Filter0}};
+                                         (_) ->
+                                              false
+                                      end, Filters0),
+            Arg = {<<"x-stream-filter">>, array, Filters},
+            {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
 
-filter_to_consumer_args({map, KVList}) ->
-    filter_to_consumer_args(
-      [<<"rabbitmq:stream-offset-spec">>,
-       <<"rabbitmq:stream-filter">>,
-       <<"rabbitmq:stream-match-unfiltered">>],
-      KVList,
-      []);
-filter_to_consumer_args(_) ->
-    [].
-
-filter_to_consumer_args([], _KVList, Acc) ->
-    Acc;
-filter_to_consumer_args([<<"rabbitmq:stream-offset-spec">> = H | T], KVList, Acc) ->
-    Key = {symbol, H},
-    Arg = case keyfind_unpack_described(Key, KVList) of
-              {_, {timestamp, Ts}} ->
-                  [{<<"x-stream-offset">>, timestamp, Ts div 1000}]; %% 0.9.1 uses second based timestamps
-              {_, {utf8, Spec}} ->
-                  [{<<"x-stream-offset">>, longstr, Spec}]; %% next, last, first and "10m" etc
-              {_, {_, Offset}} when is_integer(Offset) ->
-                  [{<<"x-stream-offset">>, long, Offset}]; %% integer offset
-              _ ->
-                  []
-          end,
-    filter_to_consumer_args(T, KVList, Arg ++ Acc);
-filter_to_consumer_args([<<"rabbitmq:stream-filter">> = H | T], KVList, Acc) ->
-    Key = {symbol, H},
-    Arg = case keyfind_unpack_described(Key, KVList) of
-              {_, {list, Filters0}} when is_list(Filters0) ->
-                  Filters = lists:foldl(fun({utf8, Filter}, L) ->
-                                                [{longstr, Filter} | L];
-                                           (_, L) ->
-                                                L
-                                        end, [], Filters0),
-                  [{<<"x-stream-filter">>, array, Filters}];
-              {_, {utf8, Filter}} ->
-                  [{<<"x-stream-filter">>, longstr, Filter}];
-              _ ->
-                  []
-          end,
-    filter_to_consumer_args(T, KVList, Arg ++ Acc);
-filter_to_consumer_args([<<"rabbitmq:stream-match-unfiltered">> = H | T], KVList, Acc) ->
-    Key = {symbol, H},
-    Arg = case keyfind_unpack_described(Key, KVList) of
-              {_, MU} when is_boolean(MU) ->
-                  [{<<"x-stream-match-unfiltered">>, bool, MU}];
-              _ ->
-                  []
-          end,
-    filter_to_consumer_args(T, KVList, Arg ++ Acc);
-filter_to_consumer_args([_ | T], KVList, Acc) ->
-    filter_to_consumer_args(T, KVList, Acc).
-
-keyfind_unpack_described(Key, KvList) ->
-    %% filterset values _should_ be described values
-    %% they aren't always however for historical reasons so we need this bit of
-    %% code to return a plain value for the given filter key
-    case lists:keyfind(Key, 1, KvList) of
-        {Key, {described, Key, Value}} ->
-            {Key, Value};
-        {Key, _} = Kv ->
-            Kv;
+        {utf8, Filter0} ->
+            Arg = {<<"x-stream-filter">>, longstr, Filter0},
+            {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
+        _ ->
+            Acc
+    end;
+parse_filters(Filter = {{symbol, _Key}, {described, {symbol, <<"rabbitmq:stream-match-unfiltered">>}, Match}},
+              {EffectiveFilters, ConsumerFilter, ConsumerArgs})
+  when is_boolean(Match) ->
+    Arg = {<<"x-stream-match-unfiltered">>, bool, Match},
+    {[Filter | EffectiveFilters], ConsumerFilter, [Arg | ConsumerArgs]};
+parse_filters({Symbol = {symbol, <<"rabbitmq:stream-", _/binary>>}, Value}, Acc)
+  when element(1, Value) =/= described ->
+    case rabbit_deprecated_features:is_permitted(amqp_filter_set_bug) of
+        true ->
+            parse_filters({Symbol, {described, Symbol, Value}}, Acc);
         false ->
-            false
+            Acc
+    end;
+parse_filters(Filter = {{symbol, _Key}, Value},
+              Acc = {EffectiveFilters, ConsumerFilter, ConsumerArgs}) ->
+    case rabbit_amqp_filtex:validate(Value) of
+        {ok, FilterExpression = {FilterType, _}} ->
+            case proplists:is_defined(FilterType, ConsumerFilter) of
+                true ->
+                    %% For now, let's prohibit multiple top level filters of the same type
+                    %% (properties or application-properties). There should be no use case.
+                    %% In future, we can allow multiple times the same top level grouping
+                    %% filter expression type (all/any/not).
+                    Acc;
+                false ->
+                    {[Filter | EffectiveFilters], [FilterExpression | ConsumerFilter], ConsumerArgs}
+            end;
+        error ->
+            Acc
     end.
 
 validate_attach(#'v1_0.attach'{target = #'v1_0.coordinator'{}}) ->
@@ -3062,6 +3122,22 @@ validate_multi_transfer_settled(Other, First)
       "(interpreted) field 'settled' on first transfer (~p)",
       [Other, First]).
 
+validate_transfer_snd_settle_mode(mixed, _Settled) ->
+    ok;
+validate_transfer_snd_settle_mode(unsettled, false) ->
+    %% "If the negotiated value for snd-settle-mode at attachment is unsettled,
+    %% then this field MUST be false (or unset) on every transfer frame for a delivery" [2.7.5]
+    ok;
+validate_transfer_snd_settle_mode(settled, true) ->
+    %% "If the negotiated value for snd-settle-mode at attachment is settled,
+    %% then this field MUST be true on at least one transfer frame for a delivery" [2.7.5]
+    ok;
+validate_transfer_snd_settle_mode(SndSettleMode, Settled) ->
+    protocol_error(
+      ?V_1_0_CONNECTION_ERROR_FRAMING_ERROR,
+      "sender settle mode is '~s' but transfer settled flag is interpreted as being '~s'",
+      [SndSettleMode, Settled]).
+
 %% "If the message is being sent settled by the sender,
 %% the value of this field [rcv-settle-mode] is ignored." [2.7.5]
 validate_transfer_rcv_settle_mode(?V_1_0_RECEIVER_SETTLE_MODE_SECOND, _Settled = false) ->
@@ -3071,9 +3147,8 @@ validate_transfer_rcv_settle_mode(_, _) ->
 
 validate_message_size(_, unlimited) ->
     ok;
-validate_message_size(Message, MaxMsgSize)
-  when is_integer(MaxMsgSize) ->
-    MsgSize = iolist_size(Message),
+validate_message_size(MsgSize, MaxMsgSize)
+  when is_integer(MsgSize) ->
     case MsgSize =< MaxMsgSize of
         true ->
             ok;
@@ -3087,7 +3162,9 @@ validate_message_size(Message, MaxMsgSize)
               ?V_1_0_LINK_ERROR_MESSAGE_SIZE_EXCEEDED,
               "message size (~b bytes) > maximum message size (~b bytes)",
               [MsgSize, MaxMsgSize])
-    end.
+    end;
+validate_message_size(Msg, MaxMsgSize) ->
+    validate_message_size(iolist_size(Msg), MaxMsgSize).
 
 -spec ensure_terminus(source | target,
                       term(),
@@ -3278,26 +3355,22 @@ publisher_or_consumer_deleted(
 
 %% If we previously already sent a detach with an error condition, and the Detach we
 %% receive here is therefore the client's reply, do not reply again with a 3rd detach.
-maybe_detach_reply(
-  Detach,
-  #state{incoming_links = NewIncomingLinks,
-         outgoing_links = NewOutgoingLinks,
-         incoming_management_links = NewIncomingMgmtLinks,
-         outgoing_management_links = NewOutgoingMgmtLinks,
-         cfg = #cfg{writer_pid = WriterPid,
-                    channel_num = Ch}},
-  #state{incoming_links = OldIncomingLinks,
-         outgoing_links = OldOutgoingLinks,
-         incoming_management_links = OldIncomingMgmtLinks,
-         outgoing_management_links = OldOutgoingMgmtLinks})
+detach_reply(Detach,
+             #state{incoming_links = NewIncomingLinks,
+                    outgoing_links = NewOutgoingLinks,
+                    incoming_management_links = NewIncomingMgmtLinks,
+                    outgoing_management_links = NewOutgoingMgmtLinks},
+             #state{incoming_links = OldIncomingLinks,
+                    outgoing_links = OldOutgoingLinks,
+                    incoming_management_links = OldIncomingMgmtLinks,
+                    outgoing_management_links = OldOutgoingMgmtLinks})
   when map_size(NewIncomingLinks) < map_size(OldIncomingLinks) orelse
        map_size(NewOutgoingLinks) < map_size(OldOutgoingLinks) orelse
        map_size(NewIncomingMgmtLinks) < map_size(OldIncomingMgmtLinks) orelse
        map_size(NewOutgoingMgmtLinks) < map_size(OldOutgoingMgmtLinks) ->
-    Reply = Detach#'v1_0.detach'{error = undefined},
-    rabbit_amqp_writer:send_command(WriterPid, Ch, Reply);
-maybe_detach_reply(_, _, _) ->
-    ok.
+    [Detach#'v1_0.detach'{error = undefined}];
+detach_reply(_, _, _) ->
+    [].
 
 -spec maybe_detach_mgmt_link(link_handle(), state()) -> state().
 maybe_detach_mgmt_link(

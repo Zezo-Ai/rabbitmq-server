@@ -16,6 +16,7 @@
 ,   amqp_auth_SUITE
 ,   amqp_client_SUITE
 ,   amqp_credit_api_v2_SUITE
+,   amqp_filtex_SUITE
 ,   amqp_proxy_protocol_SUITE
 ,   amqp_system_SUITE
 ,   amqpl_consumer_ack_SUITE
@@ -48,7 +49,6 @@
     cli_forget_cluster_node_SUITE
 ,   feature_flags_SUITE
 ,   feature_flags_v2_SUITE
-,   feature_flags_with_unpriveleged_user_SUITE
 ,   list_consumers_sanity_check_SUITE
 ,   list_queues_online_and_offline_SUITE
 ,   logging_SUITE
@@ -66,7 +66,8 @@
 ]}.
 
 {define, 'Set4', [
-    peer_discovery_dns_SUITE
+    msg_size_metrics_SUITE
+,   peer_discovery_dns_SUITE
 ,   peer_discovery_tmp_hidden_node_SUITE
 ,   per_node_limit_SUITE
 ,   per_user_connection_channel_limit_SUITE
@@ -81,6 +82,7 @@
 ,   product_info_SUITE
 ,   proxy_protocol_SUITE
 ,   publisher_confirms_parallel_SUITE
+,   unit_msg_size_metrics_SUITE
 ]}.
 
 {define, 'Set5', [

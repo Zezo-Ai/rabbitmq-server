@@ -1523,7 +1523,14 @@ notify_policy_changed(Q) when ?is_amqqueue(Q) ->
 
 consumers(Q) when ?amqqueue_is_classic(Q) ->
     QPid = amqqueue:get_pid(Q),
-    delegate:invoke(QPid, {gen_server2, call, [consumers, infinity]});
+    try
+        delegate:invoke(QPid, {gen_server2, call, [consumers, infinity]})
+    catch
+        exit:_ ->
+            %% The queue process exited during the call.
+            %% Note that `delegate:invoke/2' catches errors but not exits.
+            []
+    end;
 consumers(Q) when ?amqqueue_is_quorum(Q) ->
     QPid = amqqueue:get_pid(Q),
     case ra:local_query(QPid, fun rabbit_fifo:query_consumers/1) of
@@ -1619,17 +1626,23 @@ delete_immediately_by_resource(Resources) ->
 -spec delete
         (amqqueue:amqqueue(), 'false', 'false', rabbit_types:username()) ->
             qlen() |
+            rabbit_types:error(timeout) |
             {protocol_error, Type :: atom(), Reason :: string(), Args :: term()};
         (amqqueue:amqqueue(), 'true' , 'false', rabbit_types:username()) ->
-            qlen() | rabbit_types:error('in_use') |
+            qlen() |
+            rabbit_types:error('in_use') |
+            rabbit_types:error(timeout) |
             {protocol_error, Type :: atom(), Reason :: string(), Args :: term()};
         (amqqueue:amqqueue(), 'false', 'true', rabbit_types:username()) ->
-            qlen() | rabbit_types:error('not_empty') |
+            qlen() |
+            rabbit_types:error('not_empty') |
+            rabbit_types:error(timeout) |
             {protocol_error, Type :: atom(), Reason :: string(), Args :: term()};
         (amqqueue:amqqueue(), 'true' , 'true', rabbit_types:username()) ->
             qlen() |
             rabbit_types:error('in_use') |
             rabbit_types:error('not_empty') |
+            rabbit_types:error(timeout) |
             {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
     rabbit_queue_type:delete(Q, IfUnused, IfEmpty, ActingUser).
@@ -1691,7 +1704,10 @@ delete_crashed(Q) when ?amqqueue_is_classic(Q) ->
 delete_crashed(Q, ActingUser) when ?amqqueue_is_classic(Q) ->
     rabbit_classic_queue:delete_crashed(Q, ActingUser).
 
--spec delete_crashed_internal(amqqueue:amqqueue(), rabbit_types:username()) -> 'ok'.
+-spec delete_crashed_internal(Q, ActingUser) -> Ret when
+      Q :: amqqueue:amqqueue(),
+      ActingUser :: rabbit_types:username(),
+      Ret :: ok | {error, timeout}.
 delete_crashed_internal(Q, ActingUser) when ?amqqueue_is_classic(Q) ->
     rabbit_classic_queue:delete_crashed_internal(Q, ActingUser).
 
@@ -1802,8 +1818,8 @@ internal_delete(Queue, ActingUser, Reason) ->
         {error, timeout} = Err ->
             Err;
         Deletions ->
-            _ = rabbit_binding:process_deletions(Deletions),
-            rabbit_binding:notify_deletions(Deletions, ?INTERNAL_USER),
+            ok = rabbit_binding:process_deletions(Deletions),
+            ok = rabbit_binding:notify_deletions(Deletions, ?INTERNAL_USER),
             rabbit_core_metrics:queue_deleted(QueueName),
             ok = rabbit_event:notify(queue_deleted,
                                      [{name, QueueName},
@@ -1816,6 +1832,7 @@ internal_delete(Queue, ActingUser, Reason) ->
 %% TODO this is used by `rabbit_mnesia:remove_node_if_mnesia_running`
 %% Does it make any sense once mnesia is not used/removed?
 forget_all_durable(Node) ->
+    rabbit_log:info("Will remove all classic queues from node ~ts. The node is likely being removed from the cluster.", [Node]),
     UpdateFun = fun(Q) ->
                         forget_node_for_queue(Q)
                 end,
@@ -1925,14 +1942,14 @@ filter_transient_queues_to_delete(Node) ->
     end.
 
 notify_queue_binding_deletions(QueueDeletions) when is_list(QueueDeletions) ->
-    Deletions = rabbit_binding:process_deletions(
-                  lists:foldl(fun rabbit_binding:combine_deletions/2,
-                              rabbit_binding:new_deletions(),
-                              QueueDeletions)),
+    Deletions = lists:foldl(
+                  fun rabbit_binding:combine_deletions/2,
+                  rabbit_binding:new_deletions(), QueueDeletions),
+    ok = rabbit_binding:process_deletions(Deletions),
     rabbit_binding:notify_deletions(Deletions, ?INTERNAL_USER);
 notify_queue_binding_deletions(QueueDeletions) ->
-    Deletions = rabbit_binding:process_deletions(QueueDeletions),
-    rabbit_binding:notify_deletions(Deletions, ?INTERNAL_USER).
+    ok = rabbit_binding:process_deletions(QueueDeletions),
+    rabbit_binding:notify_deletions(QueueDeletions, ?INTERNAL_USER).
 
 notify_transient_queues_deleted(QueueDeletions) ->
     lists:foreach(

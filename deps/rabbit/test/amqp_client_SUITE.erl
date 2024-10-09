@@ -27,6 +27,17 @@
 -import(event_recorder,
         [assert_event_type/2,
          assert_event_prop/2]).
+-import(amqp_utils,
+        [init/1, init/2,
+         connection_config/1, connection_config/2,
+         flush/1,
+         wait_for_credit/1,
+         wait_for_accepts/1,
+         send_messages/3, send_messages/4,
+         detach_link_sync/1,
+         end_session_sync/1,
+         wait_for_session_end/1,
+         close_connection_sync/1]).
 
 all() ->
     [
@@ -44,6 +55,7 @@ groups() ->
        sender_settle_mode_unsettled,
        sender_settle_mode_unsettled_fanout,
        sender_settle_mode_mixed,
+       invalid_transfer_settled_flag,
        quorum_queue_rejects,
        receiver_settle_mode_first,
        publishing_to_non_existing_queue_should_settle_with_released,
@@ -61,7 +73,8 @@ groups() ->
        server_closes_link_classic_queue,
        server_closes_link_quorum_queue,
        server_closes_link_stream,
-       server_closes_link_exchange,
+       server_closes_link_exchange_settled,
+       server_closes_link_exchange_unsettled,
        link_target_classic_queue_deleted,
        link_target_quorum_queue_deleted,
        target_queues_deleted_accepted,
@@ -98,7 +111,7 @@ groups() ->
        max_message_size_client_to_server,
        max_message_size_server_to_client,
        global_counters,
-       stream_filtering,
+       stream_bloom_filter,
        available_messages_classic_queue,
        available_messages_quorum_queue,
        available_messages_stream,
@@ -110,7 +123,6 @@ groups() ->
        idle_time_out_on_server,
        idle_time_out_on_client,
        idle_time_out_too_short,
-       rabbit_status_connection_count,
        handshake_timeout,
        credential_expires,
        attach_to_exclusive_queue,
@@ -356,7 +368,7 @@ reliable_send_receive_with_outcomes(QType, Config) ->
     Outcomes = [
                 accepted,
                 modified,
-                {modified, true, false, #{<<"fruit">> => <<"banana">>}},
+                {modified, true, false, #{<<"x-fruit">> => <<"banana">>}},
                 {modified, false, true, #{}},
                 rejected,
                 released
@@ -758,6 +770,51 @@ sender_settle_mode_mixed(Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
 
+invalid_transfer_settled_flag(Config) ->
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session1} = amqp10_client:begin_session(Connection),
+    {ok, Session2} = amqp10_client:begin_session(Connection),
+    TargetAddr = rabbitmq_amqp_address:exchange(<<"amq.fanout">>),
+    {ok, SenderSettled} = amqp10_client:attach_sender_link_sync(
+                            Session1, <<"link 1">>, TargetAddr, settled),
+    {ok, SenderUnsettled} = amqp10_client:attach_sender_link_sync(
+                              Session2, <<"link 2">>, TargetAddr, unsettled),
+    ok = wait_for_credit(SenderSettled),
+    ok = wait_for_credit(SenderUnsettled),
+
+    ok = amqp10_client:send_msg(SenderSettled, amqp10_msg:new(<<"tag1">>, <<"m1">>, false)),
+    receive
+        {amqp10_event,
+         {session, Session1,
+          {ended,
+           #'v1_0.error'{
+              condition = ?V_1_0_CONNECTION_ERROR_FRAMING_ERROR,
+              description = {utf8, Description1}}}}} ->
+            ?assertEqual(
+               <<"sender settle mode is 'settled' but transfer settled flag is interpreted as being 'false'">>,
+               Description1)
+    after 5000 -> flush(missing_ended),
+                  ct:fail({missing_event, ?LINE})
+    end,
+
+    ok = amqp10_client:send_msg(SenderUnsettled, amqp10_msg:new(<<"tag2">>, <<"m2">>, true)),
+    receive
+        {amqp10_event,
+         {session, Session2,
+          {ended,
+           #'v1_0.error'{
+              condition = ?V_1_0_CONNECTION_ERROR_FRAMING_ERROR,
+              description = {utf8, Description2}}}}} ->
+            ?assertEqual(
+               <<"sender settle mode is 'unsettled' but transfer settled flag is interpreted as being 'true'">>,
+               Description2)
+    after 5000 -> flush(missing_ended),
+                  ct:fail({missing_event, ?LINE})
+    end,
+
+    ok = amqp10_client:close_connection(Connection).
+
 quorum_queue_rejects(Config) ->
     {Connection, Session, LinkPair} = init(Config),
     QName = atom_to_binary(?FUNCTION_NAME),
@@ -1125,7 +1182,7 @@ amqp_amqpl(QType, Config) ->
                #{"my int" => -2},
                amqp10_msg:new(<<>>, Body1, true)))),
     %% Send with footer
-    Footer = #'v1_0.footer'{content = [{{symbol, <<"my footer">>}, {ubyte, 255}}]},
+    Footer = #'v1_0.footer'{content = [{{symbol, <<"x-my footer">>}, {ubyte, 255}}]},
     ok = amqp10_client:send_msg(
            Sender,
            amqp10_msg:from_amqp_records(
@@ -1468,7 +1525,13 @@ server_closes_link(QType, Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
 
-server_closes_link_exchange(Config) ->
+server_closes_link_exchange_settled(Config) ->
+    server_closes_link_exchange(true, Config).
+
+server_closes_link_exchange_unsettled(Config) ->
+    server_closes_link_exchange(false, Config).
+
+server_closes_link_exchange(Settled, Config) ->
     XName = atom_to_binary(?FUNCTION_NAME),
     QName = <<"my queue">>,
     RoutingKey = <<"my routing key">>,
@@ -1498,8 +1561,13 @@ server_closes_link_exchange(Config) ->
     %% When we publish the next message, we expect:
     %% 1. that the message is released because the exchange doesn't exist anymore, and
     DTag2 = <<255>>,
-    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag2, <<"m2">>, false)),
-    ok = wait_for_settlement(DTag2, released),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag2, <<"m2">>, Settled)),
+    case Settled of
+        true ->
+            ok;
+        false ->
+            ok = wait_for_settlement(DTag2, released)
+    end,
     %% 2. that the server closes the link, i.e. sends us a DETACH frame.
     receive {amqp10_event,
              {link, Sender,
@@ -1663,18 +1731,19 @@ events(Config) ->
 
     Protocol = {protocol, {1, 0}},
     AuthProps = [{name, <<"guest">>},
-                       {auth_mechanism, <<"PLAIN">>},
-                       {ssl, false},
-                       Protocol],
+                 {auth_mechanism, <<"PLAIN">>},
+                 {ssl, false},
+                 Protocol],
     ?assertMatch(
-      {value, _},
-      find_event(user_authentication_success, AuthProps, Events)),
+       {value, _},
+       find_event(user_authentication_success, AuthProps, Events)),
 
     Node = get_node_config(Config, 0, nodename),
     ConnectionCreatedProps = [Protocol,
                               {node, Node},
                               {vhost, <<"/">>},
                               {user, <<"guest">>},
+                              {container_id, <<"my container">>},
                               {type, network}],
     {value, ConnectionCreatedEvent} = find_event(
                                         connection_created,
@@ -1695,8 +1764,8 @@ events(Config) ->
                              Pid,
                              ClientProperties],
     ?assertMatch(
-      {value, _},
-      find_event(connection_closed, ConnectionClosedProps, Events)),
+       {value, _},
+       find_event(connection_closed, ConnectionClosedProps, Events)),
     ok.
 
 sync_get_unsettled_classic_queue(Config) ->
@@ -2599,7 +2668,7 @@ single_active_consumer_drain(QType, Config) ->
 %% "After a consumer is cancelled there will be no future deliveries dispatched to it.
 %% Note that there can still be "in flight" deliveries dispatched previously.
 %% Cancelling a consumer will neither discard nor requeue them."
-%% [https://www.rabbitmq.com/consumers.html#unsubscribing]
+%% [https://www.rabbitmq.com/docs/consumers#unsubscribing]
 detach_requeues_one_session_classic_queue(Config) ->
     detach_requeue_one_session(<<"classic">>, Config).
 
@@ -3197,7 +3266,7 @@ target_queue_deleted(Config) ->
     after 5000 -> ct:fail({missing_accepted, DTag1})
     end,
 
-    N0 = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    N0 = get_node_config(Config, 0, nodename),
     RaName = ra_name(QuorumQ),
     ServerId0 = {RaName, N0},
     {ok, Members, _Leader} = ra:members(ServerId0),
@@ -3697,8 +3766,12 @@ list_connections(Config) ->
     [ok = rabbit_ct_client_helpers:close_channels_and_connection(Config, Node) || Node <- [0, 1, 2]],
 
     Connection091 = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
-    {ok, C0} = amqp10_client:open_connection(connection_config(0, Config)),
-    {ok, C2} = amqp10_client:open_connection(connection_config(2, Config)),
+    ContainerId0 = <<"ID 0">>,
+    ContainerId2 = <<"ID 2">>,
+    Cfg0 = maps:put(container_id, ContainerId0, connection_config(0, Config)),
+    Cfg2 = maps:put(container_id, ContainerId2, connection_config(2, Config)),
+    {ok, C0} = amqp10_client:open_connection(Cfg0),
+    {ok, C2} = amqp10_client:open_connection(Cfg2),
     receive {amqp10_event, {connection, C0, opened}} -> ok
     after 5000 -> ct:fail({missing_event, ?LINE})
     end,
@@ -3706,8 +3779,8 @@ list_connections(Config) ->
     after 5000 -> ct:fail({missing_event, ?LINE})
     end,
 
-    {ok, StdOut} = rabbit_ct_broker_helpers:rabbitmqctl(Config, 0, ["list_connections", "--silent", "protocol"]),
-    Protocols0 = re:split(StdOut, <<"\n">>, [trim]),
+    {ok, StdOut0} = rabbit_ct_broker_helpers:rabbitmqctl(Config, 0, ["list_connections", "--silent", "protocol"]),
+    Protocols0 = re:split(StdOut0, <<"\n">>, [trim]),
     %% Remove any whitespaces.
     Protocols1 = [binary:replace(Subject, <<" ">>, <<>>, [global]) || Subject <- Protocols0],
     Protocols = lists:sort(Protocols1),
@@ -3715,6 +3788,13 @@ list_connections(Config) ->
                   <<"{1,0}">>,
                   <<"{1,0}">>],
                  Protocols),
+
+    %% CLI should list AMQP 1.0 container-id
+    {ok, StdOut1} = rabbit_ct_broker_helpers:rabbitmqctl(Config, 0, ["list_connections", "--silent", "container_id"]),
+    ContainerIds0 = re:split(StdOut1, <<"\n">>, [trim]),
+    ContainerIds = lists:sort(ContainerIds0),
+    ?assertEqual([<<>>, ContainerId0, ContainerId2],
+                 ContainerIds),
 
     ok = rabbit_ct_client_helpers:close_connection(Connection091),
     ok = close_connection_sync(C0),
@@ -3868,7 +3948,7 @@ global_counters(Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
 
-stream_filtering(Config) ->
+stream_bloom_filter(Config) ->
     Stream = atom_to_binary(?FUNCTION_NAME),
     Address = rabbitmq_amqp_address:queue(Stream),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
@@ -4236,7 +4316,7 @@ trace(Config) ->
     ok = end_session_sync(SessionReceiver),
     ok = amqp10_client:close_connection(Connection).
 
-%% https://www.rabbitmq.com/validated-user-id.html
+%% https://www.rabbitmq.com/docs/validated-user-id
 user_id(Config) ->
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -4402,27 +4482,12 @@ idle_time_out_too_short(Config) ->
     after 5000 -> ct:fail({missing_event, ?LINE})
     end.
 
-rabbit_status_connection_count(Config) ->
-    %% Close any open AMQP 0.9.1 connections from previous test cases.
-    ok = rabbit_ct_client_helpers:close_channels_and_connection(Config, 0),
-
-    OpnConf = connection_config(Config),
-    {ok, Connection} = amqp10_client:open_connection(OpnConf),
-    receive {amqp10_event, {connection, Connection, opened}} -> ok
-    after 5000 -> ct:fail({missing_event, ?LINE})
-    end,
-
-    {ok, String} = rabbit_ct_broker_helpers:rabbitmqctl(Config, 0, ["status"]),
-    ?assertNotEqual(nomatch, string:find(String, "Connection count: 1")),
-
-    ok = amqp10_client:close_connection(Connection).
-
 handshake_timeout(Config) ->
     App = rabbit,
     Par = ?FUNCTION_NAME,
     {ok, DefaultVal} = rpc(Config, application, get_env, [App, Par]),
     ok = rpc(Config, application, set_env, [App, Par, 200]),
-    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    Port = get_node_config(Config, 0, tcp_port_amqp),
     {ok, Socket} = gen_tcp:connect("localhost", Port, [{active, false}]),
     ?assertEqual({error, closed}, gen_tcp:recv(Socket, 0, 400)),
     ok = rpc(Config, application, set_env, [App, Par, DefaultVal]).
@@ -4765,7 +4830,7 @@ dead_letter_reject_message_order(QType, Config) ->
     {ok, _} = rabbitmq_amqp_client:declare_queue(LinkPair, QName2, #{}),
 
     {ok, Sender} = amqp10_client:attach_sender_link(
-                     Session, <<"sender">>, rabbitmq_amqp_address:queue(QName1), unsettled),
+                     Session, <<"sender">>, rabbitmq_amqp_address:queue(QName1), settled),
     wait_for_credit(Sender),
     {ok, Receiver1} = amqp10_client:attach_receiver_link(
                         Session, <<"receiver 1">>, rabbitmq_amqp_address:queue(QName1), unsettled),
@@ -4856,7 +4921,7 @@ dead_letter_reject_many_message_order(QType, Config) ->
     {ok, _} = rabbitmq_amqp_client:declare_queue(LinkPair, QName2, #{}),
 
     {ok, Sender} = amqp10_client:attach_sender_link(
-                     Session, <<"sender">>, rabbitmq_amqp_address:queue(QName1), unsettled),
+                     Session, <<"sender">>, rabbitmq_amqp_address:queue(QName1), settled),
     wait_for_credit(Sender),
     {ok, Receiver1} = amqp10_client:attach_receiver_link(
                         Session, <<"receiver 1">>, rabbitmq_amqp_address:queue(QName1), unsettled),
@@ -5145,7 +5210,7 @@ footer_checksum(FooterOpt, Config) ->
     SndAttachArgs = #{name => <<"my sender">>,
                       role => {sender, #{address => Addr,
                                          durable => configuration}},
-                      snd_settle_mode => settled,
+                      snd_settle_mode => mixed,
                       rcv_settle_mode => first,
                       footer_opt => FooterOpt},
     {ok, Receiver} = amqp10_client:attach_link(Session, RecvAttachArgs),
@@ -5159,7 +5224,7 @@ footer_checksum(FooterOpt, Config) ->
              priority => 7,
              ttl => 100_000},
            amqp10_msg:set_delivery_annotations(
-             #{"a" => "b"},
+             #{"x-a" => "b"},
              amqp10_msg:set_message_annotations(
                #{"x-string" => "string-value",
                  "x-int" => 3,
@@ -5708,16 +5773,6 @@ link_max_per_session(Config) ->
 %% internal
 %%
 
-init(Config) ->
-    init(0, Config).
-
-init(Node, Config) ->
-    OpnConf = connection_config(Node, Config),
-    {ok, Connection} = amqp10_client:open_connection(OpnConf),
-    {ok, Session} = amqp10_client:begin_session_sync(Connection),
-    {ok, LinkPair} = rabbitmq_amqp_client:attach_management_link_pair_sync(Session, <<"my link pair">>),
-    {Connection, Session, LinkPair}.
-
 receive_all_messages(Receiver, Accept) ->
     receive_all_messages0(Receiver, Accept, []).
 
@@ -5732,26 +5787,6 @@ receive_all_messages0(Receiver, Accept, Acc) ->
               lists:reverse(Acc)
     end.
 
-connection_config(Config) ->
-    connection_config(0, Config).
-
-connection_config(Node, Config) ->
-    Host = ?config(rmq_hostname, Config),
-    Port = rabbit_ct_broker_helpers:get_node_config(Config, Node, tcp_port_amqp),
-    #{address => Host,
-      port => Port,
-      container_id => <<"my container">>,
-      sasl => {plain, <<"guest">>, <<"guest">>}}.
-
-flush(Prefix) ->
-    receive
-        Msg ->
-            ct:pal("~p flushed: ~p~n", [Prefix, Msg]),
-            flush(Prefix)
-    after 1 ->
-              ok
-    end.
-
 open_and_close_connection(Config) ->
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -5759,58 +5794,6 @@ open_and_close_connection(Config) ->
     after 5000 -> ct:fail(opened_timeout)
     end,
     ok = close_connection_sync(Connection).
-
-% before we can send messages we have to wait for credit from the server
-wait_for_credit(Sender) ->
-    receive
-        {amqp10_event, {link, Sender, credited}} ->
-            ok
-    after 5000 ->
-              flush("wait_for_credit timed out"),
-              ct:fail(credited_timeout)
-    end.
-
-detach_link_sync(Link) ->
-    ok = amqp10_client:detach_link(Link),
-    ok = wait_for_link_detach(Link).
-
-wait_for_link_detach(Link) ->
-    receive
-        {amqp10_event, {link, Link, {detached, normal}}} ->
-            flush(?FUNCTION_NAME),
-            ok
-    after 5000 ->
-              flush("wait_for_link_detach timed out"),
-              ct:fail({link_detach_timeout, Link})
-    end.
-
-end_session_sync(Session) ->
-    ok = amqp10_client:end_session(Session),
-    ok = wait_for_session_end(Session).
-
-wait_for_session_end(Session) ->
-    receive
-        {amqp10_event, {session, Session, {ended, _}}} ->
-            flush(?FUNCTION_NAME),
-            ok
-    after 5000 ->
-              flush("wait_for_session_end timed out"),
-              ct:fail({session_end_timeout, Session})
-    end.
-
-close_connection_sync(Connection) ->
-    ok = amqp10_client:close_connection(Connection),
-    ok = wait_for_connection_close(Connection).
-
-wait_for_connection_close(Connection) ->
-    receive
-        {amqp10_event, {connection, Connection, {closed, normal}}} ->
-            flush(?FUNCTION_NAME),
-            ok
-    after 5000 ->
-              flush("wait_for_connection_close timed out"),
-              ct:fail({connection_close_timeout, Connection})
-    end.
 
 wait_for_accepted(Tag) ->
     wait_for_settlement(Tag, accepted).
@@ -5822,16 +5805,6 @@ wait_for_settlement(Tag, State) ->
     after 5000 ->
               flush("wait_for_settlement timed out"),
               ct:fail({settled_timeout, Tag})
-    end.
-
-wait_for_accepts(0) ->
-    ok;
-wait_for_accepts(N) ->
-    receive
-        {amqp10_disposition,{accepted,_}} ->
-            wait_for_accepts(N - 1)
-    after 5000 ->
-              ct:fail({missing_accepted, N})
     end.
 
 delete_queue(Session, QName) ->
@@ -5884,32 +5857,6 @@ count_received_messages0(Receiver, Count) ->
               Count
     end.
 
-send_messages(Sender, Left, Settled) ->
-    send_messages(Sender, Left, Settled, <<>>).
-
-send_messages(_, 0, _, _) ->
-    ok;
-send_messages(Sender, Left, Settled, BodySuffix) ->
-    Bin = integer_to_binary(Left),
-    Body = <<Bin/binary, BodySuffix/binary>>,
-    Msg = amqp10_msg:new(Bin, Body, Settled),
-    case amqp10_client:send_msg(Sender, Msg) of
-        ok ->
-            send_messages(Sender, Left - 1, Settled, BodySuffix);
-        {error, insufficient_credit} ->
-            ok = wait_for_credit(Sender),
-            %% The credited event we just processed could have been received some time ago,
-            %% i.e. we might have 0 credits right now. This happens in the following scenario:
-            %% 1. We (test case proc) send a message successfully, the client session proc decrements remaining link credit from 1 to 0.
-            %% 2. The server grants our client session proc new credits.
-            %% 3. The client session proc sends us (test case proc) a credited event.
-            %% 4. We didn't even notice that we ran out of credits temporarily. We send the next message, it succeeds,
-            %%    but do not process the credited event in our mailbox.
-            %% So, we must be defensive here and assume that the next amqp10_client:send/2 call might return {error, insufficient_credit}
-            %% again causing us then to really wait to receive a credited event (instead of just processing an old credited event).
-            send_messages(Sender, Left, Settled, BodySuffix)
-    end.
-
 assert_link_credit_runs_out(_Sender, 0) ->
     ct:fail(sufficient_link_credit);
 assert_link_credit_runs_out(Sender, Left) ->
@@ -5950,7 +5897,7 @@ assert_messages(QNameBin, NumTotalMsgs, NumUnackedMsgs, Config, Node) ->
              Infos = rpc(Config, Node, rabbit_amqqueue, info, [Q, [messages, messages_unacknowledged]]),
              lists:sort(Infos)
          end
-        ), 500, 5).
+        ), 500, 10).
 
 serial_number_increment(S) ->
     case S + 1 of
@@ -6037,8 +5984,8 @@ find_event(Type, Props, Events) when is_list(Props), is_list(Events) ->
       fun(#event{type = EventType, props = EventProps}) ->
               Type =:= EventType andalso
                 lists:all(
-                  fun({Key, _Value}) ->
-                          lists:keymember(Key, 1, EventProps)
+                  fun(Prop) ->
+                          lists:member(Prop, EventProps)
                   end, Props)
       end, Events).
 

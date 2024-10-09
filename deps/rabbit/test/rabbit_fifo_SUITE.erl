@@ -42,12 +42,12 @@ groups() ->
     ].
 
 init_per_group(tests, Config) ->
-    [{machine_version, 4} | Config];
+    [{machine_version, 5} | Config];
 init_per_group(machine_version_conversion, Config) ->
     Config.
 
 init_per_testcase(_Testcase, Config) ->
-    FF = ?config(machine_version, Config) == 4,
+    FF = ?config(machine_version, Config) == 5,
     ok = meck:new(rabbit_feature_flags, [passthrough]),
     meck:expect(rabbit_feature_flags, is_enabled, fun (_) -> FF end),
     Config.
@@ -802,6 +802,19 @@ discarded_message_with_dead_letter_handler_emits_log_effect_test(Config) ->
     ?assertEqual(undefined, mc:get_annotation(acquired_count, McOut)),
     ?assertEqual(1, mc:get_annotation(delivery_count, McOut)),
 
+    ok.
+
+discard_after_cancel_test(Config) ->
+    Cid = {?FUNCTION_NAME_B, self()},
+    {State0, _} = enq(Config, 1, 1, first, test_init(test)),
+    {State1, #{key := _CKey,
+               next_msg_id := MsgId}, _Effects1} =
+        checkout(Config, ?LINE, Cid, 10, State0),
+    {State2, _, _} = apply(meta(Config, ?LINE),
+                           rabbit_fifo:make_checkout(Cid, cancel, #{}), State1),
+    {State, _, _} = apply(meta(Config, ?LINE),
+                          rabbit_fifo:make_discard(Cid, [MsgId]), State2),
+    ct:pal("State ~p", [State]),
     ok.
 
 enqueued_msg_with_delivery_count_test(Config) ->
@@ -2137,7 +2150,6 @@ reject_publish_applied_after_limit_test(Config) ->
              queue_resource => QName,
              max_length => 2,
              overflow_strategy => reject_publish,
-             max_in_memory_length => 0,
              dead_letter_handler => undefined
             },
     {State5, ok, Efx1} = apply(meta(Config, 5), rabbit_fifo:make_update_config(Conf), State4),
@@ -2146,6 +2158,31 @@ reject_publish_applied_after_limit_test(Config) ->
     Pid2 = test_util:fake_pid(node()),
     {_State6, reject_publish, _} =
         apply(meta(Config, 1), make_register_enqueuer(Pid2), State5),
+    ok.
+
+update_config_delivery_limit_test(Config) ->
+    QName = rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+    InitConf = #{name => ?FUNCTION_NAME,
+                 queue_resource => QName,
+                 delivery_limit => 20
+                },
+    State0 = init(InitConf),
+    ?assertMatch(#{config := #{delivery_limit := 20}},
+                 rabbit_fifo:overview(State0)),
+
+    %% A delivery limit of -1 (or any negative value) turns the delivery_limit
+    %% off
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => QName,
+             delivery_limit => -1,
+             dead_letter_handler => undefined
+            },
+    {State1, ok, _} = apply(meta(Config, ?LINE),
+                            rabbit_fifo:make_update_config(Conf), State0),
+
+    ?assertMatch(#{config := #{delivery_limit := undefined}},
+                 rabbit_fifo:overview(State1)),
+
     ok.
 
 purge_nodes_test(Config) ->
@@ -2321,6 +2358,31 @@ aux_test(_) ->
     [X] = ets:lookup(rabbit_fifo_usage, aux_test),
     meck:unload(),
     ?assert(X > 0.0),
+    ok.
+
+handle_aux_tick_test(Config) ->
+    _ = ra_machine_ets:start_link(),
+    Aux0 = init_aux(aux_test),
+    LastApplied = 1,
+    MacState0 = init(#{name => ?FUNCTION_NAME,
+                       queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B),
+                       single_active_consumer_on => false}),
+    State0 = #{machine_state => MacState0,
+               log => mock_log,
+               last_applied => LastApplied},
+    {MacState1, _} = enq(Config, 1, 1, first, MacState0),
+    State1 = State0#{machine_state => MacState1},
+    meck:expect(ra_log, last_index_term, fun (_) -> {1, 0} end),
+    ?assertEqual(1, rabbit_fifo:smallest_raft_index(MacState1)),
+    %% the release cursor should be 1 lower than the smallest raft index
+    {no_reply, _, _,
+     [{release_cursor, 0}]} = handle_aux(leader, cast, tick, Aux0, State1),
+    timer:sleep(10),
+
+    persistent_term:put(quorum_queue_checkpoint_config, {1, 0, 1}),
+    {no_reply, _, _,
+     [{checkpoint, 1, _},
+      {release_cursor, 0}]} = handle_aux(follower, cast, force_checkpoint, Aux0, State1),
     ok.
 
 
@@ -2737,44 +2799,8 @@ modify_test(Config) ->
 
     ok.
 
-ttb_test(Config) ->
-    S0 = init(#{name => ?FUNCTION_NAME,
-                queue_resource =>
-                    rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)}),
-
-
-    S1 = do_n(5_000_000,
-           fun (N, Acc) ->
-                   I = (5_000_000 - N),
-                   element(1, enq(Config, I, I, ?FUNCTION_NAME_B, Acc))
-           end, S0),
-
-
-
-    {T1, _Res} = timer:tc(fun () ->
-                               do_n(100, fun (_, S) ->
-                                               term_to_binary(S),
-                                               S1 end, S1)
-                       end),
-    ct:pal("T1 took ~bus", [T1]),
-
-
-    {T2, _} = timer:tc(fun () ->
-                               do_n(100, fun (_, S) -> term_to_iovec(S), S1 end, S1)
-                       end),
-    ct:pal("T2 took ~bus", [T2]),
-
-    ok.
-
 %% Utility
 %%
-
-do_n(0, _, A) ->
-    A;
-do_n(N, Fun, A0) ->
-    A = Fun(N, A0),
-    do_n(N-1, Fun, A).
-
 
 init(Conf) -> rabbit_fifo:init(Conf).
 make_register_enqueuer(Pid) -> rabbit_fifo:make_register_enqueuer(Pid).

@@ -5,7 +5,7 @@ DEPS = csv json observer_cli stdout_formatter
 TEST_DEPS = amqp amqp_client temp x509 rabbit
 
 dep_amqp = hex 3.3.0
-dep_csv = hex 3.2.0
+dep_csv = hex 3.2.1
 dep_json = hex 1.4.1
 dep_temp = hex 0.4.7
 dep_x509 = hex 0.8.8
@@ -113,7 +113,12 @@ rel:: $(ESCRIPTS)
 	@:
 
 tests:: $(ESCRIPTS)
-	$(gen_verbose) $(MIX_TEST) $(TEST_FILE)
+	$(verbose) $(MAKE) -C ../../ install-cli
+	$(verbose) $(MAKE) -C ../../ run-background-broker PLUGINS="rabbit rabbitmq_federation rabbitmq_stomp rabbitmq_stream_management amqp_client"
+	$(gen_verbose) $(MIX_TEST) $(TEST_FILE); \
+		RES=$$?; \
+		$(MAKE) -C ../../ stop-node; \
+		exit $$RES
 
 .PHONY: test
 

@@ -89,6 +89,7 @@ rabbitmq_app(
         "//deps/rabbitmq_web_dispatch:erlang_app",
         "@cowboy//:erlang_app",
         "@cowlib//:erlang_app",
+        "@cuttlefish//:erlang_app",
         "@ranch//:erlang_app",
     ],
 )
@@ -128,6 +129,11 @@ rabbitmq_suite(
         "//deps/rabbitmq_ct_helpers:erlang_app",
         "@proper//:erlang_app",
     ],
+)
+
+rabbitmq_suite(
+    name = "rabbit_mgmt_schema_SUITE",
+    size = "small",
 )
 
 rabbitmq_integration_suite(

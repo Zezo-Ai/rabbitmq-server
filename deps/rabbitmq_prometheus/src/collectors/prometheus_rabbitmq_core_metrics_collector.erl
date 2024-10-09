@@ -170,7 +170,7 @@
         {2, undefined, channel_messages_uncommitted, gauge, "Messages received in a transaction but not yet committed", messages_uncommitted},
         {2, undefined, channel_acks_uncommitted, gauge, "Message acknowledgements in a transaction not yet committed", acks_uncommitted},
         {2, undefined, consumer_prefetch, gauge, "Limit of unacknowledged messages for each consumer", prefetch_count},
-        {2, undefined, channel_prefetch, gauge, "Total limit of unacknowledged messages for all consumers on a channel", global_prefetch_count}
+        {2, undefined, channel_prefetch, gauge, "Deprecated and will be removed in a future version", global_prefetch_count}
     ]},
 
     {channel_exchange_metrics, [
@@ -489,6 +489,14 @@ label({RemoteAddress, Username, Protocol}) when is_binary(RemoteAddress), is_bin
                          V =/= <<>>
                  end, [{remote_address, RemoteAddress}, {username, Username},
                        {protocol, atom_to_binary(Protocol, utf8)}]);
+label({
+    #resource{kind=queue, virtual_host=VHost, name=QName},
+    #resource{kind=exchange, name=ExName}
+ }) ->
+    %% queue_exchange_metrics {queue_id, exchange_id}
+    <<"vhost=\"", (escape_label_value(VHost))/binary, "\",",
+      "exchange=\"", (escape_label_value(ExName))/binary, "\",",
+      "queue=\"", (escape_label_value(QName))/binary, "\"">>;
 label({I1, I2}) ->
     case {label(I1), label(I2)} of
         {<<>>, L} -> L;

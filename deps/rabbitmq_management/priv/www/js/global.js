@@ -108,7 +108,8 @@ var ALL_COLUMNS =
                         ['rate-redeliver', 'redelivered',        false],
                         ['rate-ack',       'ack',                true]]},
      'connections':
-     {'Overview': [['user',   'User name', true],
+     {'Overview': [['container_id', 'Container ID', true],
+                   ['user',   'User name', true],
                    ['state',  'State',     true]],
       'Details': [['ssl',            'TLS',      true],
                   ['ssl_info',       'TLS details',    false],
@@ -179,7 +180,7 @@ const QUEUE_EXTRA_CONTENT_REQUESTS = [];
 // All help ? popups
 var HELP = {
     'delivery-limit':
-      'The number of allowed unsuccessful delivery attempts. Once a message has been delivered unsuccessfully more than this many times it will be dropped or dead-lettered, depending on the queue configuration.',
+      'The number of allowed unsuccessful delivery attempts. Once a message has been delivered unsuccessfully more than this many times it will be dropped or dead-lettered, depending on the queue configuration. The default is always 20. A value of -1 or lower sets the limit to "unlimited".',
 
     'exchange-auto-delete':
       'If yes, the exchange will delete itself after at least one queue or exchange has been bound to this one, and then all queues or exchanges have been unbound.',
@@ -304,15 +305,12 @@ var HELP = {
       </dl>',
 
     'channel-prefetch':
-      'Channel prefetch counts. \
+      'Channel prefetch count.\
        <p> \
-         Each channel can have two prefetch counts: A per-consumer count, which \
-         will limit each new consumer created on the channel, and a global \
-         count, which is shared between all consumers on the channel.\
+         Each channel can have a prefetch count. The prefetch is the number of messages that will be held \
+         by the client. Setting a value of 0 will result in an unlimited prefetch. \
        </p> \
-       <p> \
-         This column shows one, the other, or both limits if they are set. \
-       </p>',
+       ',
 
     'file-descriptors':
       '<p>File descriptor count and limit, as reported by the operating \
@@ -445,10 +443,6 @@ var HELP = {
         <dd>Rate at which empty queues are hit in response to basic.get.</dd>\
         <dt>Return</dt>\
         <dd>Rate at which basic.return is sent to publishers for unroutable messages published with the \'mandatory\' flag set.</dd>\
-        <dt>Disk read</dt>\
-        <dd>Rate at which queues read messages from disk.</dd>\
-        <dt>Disk write</dt>\
-        <dd>Rate at which queues write messages to disk.</dd>\
       </dl>\
       <p>\
         Note that the last two items originate in queues rather than \
@@ -589,7 +583,10 @@ var HELP = {
         <dd>Rate at which queues are created. Declaring a queue that already exists counts for a "Declared" event, but not for a "Created" event. </dd>\
         <dt>Deleted</dt>\
         <dd>Rate at which queues are deleted.</dd>\
-     </dl> '
+     </dl> ',
+
+    'container-id':
+      'Name of the client application as sent from client to RabbitMQ in the "container-id" field of the AMQP 1.0 <a target="_blank" href="https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#type-open">open</a> frame.'
 
 };
 

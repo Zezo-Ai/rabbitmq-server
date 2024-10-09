@@ -73,6 +73,26 @@
     list_to_binary(cuttlefish:conf_get("auth_oauth2.additional_scopes_key", Conf))
  end}.
 
+{mapping,
+ "auth_oauth2.scope_aliases.$alias",
+ "rabbitmq_auth_backend_oauth2.scope_aliases",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.scope_aliases.$index.alias",
+ "rabbitmq_auth_backend_oauth2.scope_aliases",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.scope_aliases.$index.scope",
+ "rabbitmq_auth_backend_oauth2.scope_aliases",
+ [{datatype, string}]}.
+
+{translation,
+ "rabbitmq_auth_backend_oauth2.scope_aliases",
+ fun(Conf) ->
+    rabbit_oauth2_schema:translate_scope_aliases(Conf)
+ end}.
 
 %% Configure the plugin to skip validation of the aud field
 %%
@@ -143,6 +163,13 @@
  "rabbitmq_auth_backend_oauth2.token_endpoint",
  [{datatype, string}, {validators, ["uri", "https_uri"]}]}.
 
+%% DEPRECATES auth_oauth2.jwks_url
+{mapping,
+ "auth_oauth2.jwks_uri",
+ "rabbitmq_auth_backend_oauth2.jwks_uri",
+ [{datatype, string}, {validators, ["uri", "https_uri"]}]}.
+
+%% DEPRECATED
 {mapping,
  "auth_oauth2.jwks_url",
  "rabbitmq_auth_backend_oauth2.key_config.jwks_url",
@@ -157,6 +184,41 @@
  "auth_oauth2.authorization_endpoint",
  "rabbitmq_auth_backend_oauth2.authorization_endpoint",
  [{datatype, string}, {validators, ["uri", "https_uri"]}]}.
+
+{mapping,
+ "auth_oauth2.discovery_endpoint_path",
+ "rabbitmq_auth_backend_oauth2.discovery_endpoint_path",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.discovery_endpoint_params.$param",
+ "rabbitmq_auth_backend_oauth2.discovery_endpoint_params",
+ [{datatype, string}]}.
+
+{translation, "rabbitmq_auth_backend_oauth2.discovery_endpoint_params",
+ fun(Conf) ->
+    rabbit_oauth2_schema:translate_endpoint_params("discovery_endpoint_params", Conf)
+ end}.
+
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery_endpoint_params.$param",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery_endpoint_path",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.oauth_providers.$name.algorithms.$algorithm",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, string}]}.
+
+{translation, "rabbitmq_auth_backend_oauth2.oauth_providers",
+ fun(Conf) ->
+    rabbit_oauth2_schema:translate_oauth_providers(Conf)
+ end}.
 
 {mapping,
  "auth_oauth2.https.peer_verification",
@@ -301,6 +363,7 @@
   [{datatype, string}]
 }.
 
+
 {mapping,
   "auth_oauth2.resource_servers.$name.scope_prefix",
   "rabbitmq_auth_backend_oauth2.resource_servers",
@@ -320,6 +383,21 @@
 }.
 
 {mapping,
+ "auth_oauth2.resource_servers.$name.scope_aliases.$alias",
+ "rabbitmq_auth_backend_oauth2.resource_servers",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.scope_aliases.$index.alias",
+ "rabbitmq_auth_backend_oauth2.resource_servers",
+ [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.scope_aliases.$index.scope",
+ "rabbitmq_auth_backend_oauth2.resource_servers",
+ [{datatype, string}]}.
+
+{mapping,
   "auth_oauth2.resource_servers.$name.oauth_provider_id",
   "rabbitmq_auth_backend_oauth2.resource_servers",
   [{datatype, string}]
@@ -333,5 +411,5 @@
 
 {translation, "rabbitmq_auth_backend_oauth2.resource_servers",
  fun(Conf) ->
-    rabbit_oauth2_schema:translate_resource_servers(Conf)    
+    rabbit_oauth2_schema:translate_resource_servers(Conf)
  end}.

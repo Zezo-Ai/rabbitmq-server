@@ -168,8 +168,12 @@ delete(Q0, IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_classic(Q0) ->
                             rabbit_log:warning("Queue ~ts in vhost ~ts is down. "
                                                "Forcing queue deletion.",
                                                [Name, Vhost]),
-                            delete_crashed_internal(Q, ActingUser),
-                            {ok, 0}
+                            case delete_crashed_internal(Q, ActingUser) of
+                                ok ->
+                                    {ok, 0};
+                                {error, timeout} = Err ->
+                                    Err
+                            end
                     end
             end;
         {error, not_found} ->
@@ -551,7 +555,7 @@ delete_crashed(Q, ActingUser) ->
 
 delete_crashed_internal(Q, ActingUser) ->
     delete_crashed_in_backing_queue(Q),
-    ok = rabbit_amqqueue:internal_delete(Q, ActingUser).
+    rabbit_amqqueue:internal_delete(Q, ActingUser).
 
 delete_crashed_in_backing_queue(Q) ->
     {ok, BQ} = application:get_env(rabbit, backing_queue_module),

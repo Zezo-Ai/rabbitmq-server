@@ -16,14 +16,14 @@
 -rabbit_feature_flag(
    {quorum_queue,
     #{desc          => "Support queues of type `quorum`",
-      doc_url       => "https://www.rabbitmq.com/quorum-queues.html",
+      doc_url       => "https://www.rabbitmq.com/docs/quorum-queues",
       stability     => required
      }}).
 
 -rabbit_feature_flag(
    {stream_queue,
     #{desc          => "Support queues of type `stream`",
-      doc_url       => "https://www.rabbitmq.com/stream.html",
+      doc_url       => "https://www.rabbitmq.com/docs/stream",
       stability     => required,
       depends_on    => [quorum_queue]
      }}).
@@ -56,7 +56,7 @@
 -rabbit_feature_flag(
    {stream_single_active_consumer,
     #{desc          => "Single active consumer for streams",
-      doc_url       => "https://www.rabbitmq.com/stream.html",
+      doc_url       => "https://www.rabbitmq.com/docs/stream",
       stability     => required,
       depends_on    => [stream_queue]
      }}).
@@ -129,8 +129,8 @@
 
 -rabbit_feature_flag(
    {khepri_db,
-    #{desc          => "Use the new Khepri Raft-based metadata store",
-      doc_url       => "", %% TODO
+    #{desc          => "New Raft-based metadata store. Fully supported as of RabbitMQ 4.0",
+      doc_url       => "https://www.rabbitmq.com/docs/next/metadata-store",
       stability     => experimental,
       depends_on    => [feature_flags_v2,
                         direct_exchange_routing_v2,

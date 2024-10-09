@@ -184,7 +184,6 @@
          acks_uncommitted,
          pending_raft_commands,
          prefetch_count,
-         global_prefetch_count,
          state,
          garbage_collection]).
 
@@ -985,7 +984,7 @@ check_msg_size(Content, GCThreshold) ->
     Size = rabbit_basic:maybe_gc_large_msg(Content, GCThreshold),
     case Size =< MaxMessageSize of
         true ->
-            ok;
+            rabbit_msg_size_metrics:observe(amqp091, Size);
         false ->
             Fmt = case MaxMessageSize of
                       ?MAX_MSG_SIZE ->
@@ -2272,6 +2271,8 @@ i(pending_raft_commands,   #ch{queue_states = QS}) ->
 i(state,                   #ch{cfg = #conf{state = running}}) -> credit_flow:state();
 i(state,                   #ch{cfg = #conf{state = State}}) -> State;
 i(prefetch_count,          #ch{cfg = #conf{consumer_prefetch = C}})    -> C;
+%% Retained for backwards compatibility e.g. in mixed version clusters,
+%% can be removed starting with 4.2. MK.
 i(global_prefetch_count, #ch{limiter = Limiter}) ->
     rabbit_limiter:get_prefetch_limit(Limiter);
 i(interceptors, #ch{interceptor_state = IState}) ->

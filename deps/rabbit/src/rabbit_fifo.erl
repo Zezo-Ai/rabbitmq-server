@@ -195,7 +195,14 @@ update_config(Conf, State) ->
     Overflow = maps:get(overflow_strategy, Conf, drop_head),
     MaxLength = maps:get(max_length, Conf, undefined),
     MaxBytes = maps:get(max_bytes, Conf, undefined),
-    DeliveryLimit = maps:get(delivery_limit, Conf, undefined),
+    DeliveryLimit = case maps:get(delivery_limit, Conf, undefined) of
+                        DL when is_number(DL) andalso
+                                DL < 0 ->
+                            undefined;
+                        DL ->
+                            DL
+                    end,
+
     Expires = maps:get(expires, Conf, undefined),
     MsgTTL = maps:get(msg_ttl, Conf, undefined),
     ConsumerStrategy = case maps:get(single_active_consumer_on, Conf, false) of
@@ -258,12 +265,24 @@ apply(Meta, #settle{msg_ids = MsgIds,
         _ ->
             {State, ok}
     end;
+apply(#{machine_version := 4} = Meta,
+      #discard{consumer_key = ConsumerKey,
+               msg_ids = MsgIds},
+      #?STATE{consumers = Consumers } = State0) ->
+    %% buggy version that would have not found the consumer if the ConsumerKey
+    %% was a consumer_id()
+    case find_consumer(ConsumerKey, Consumers) of
+        {ConsumerKey, #consumer{} = Con} ->
+            discard(Meta, MsgIds, ConsumerKey, Con, true, #{}, State0);
+        _ ->
+            {State0, ok}
+    end;
 apply(Meta, #discard{consumer_key = ConsumerKey,
                      msg_ids = MsgIds},
       #?STATE{consumers = Consumers } = State0) ->
     case find_consumer(ConsumerKey, Consumers) of
-        {ConsumerKey, #consumer{} = Con} ->
-            discard(Meta, MsgIds, ConsumerKey, Con, true, #{}, State0);
+        {ActualConsumerKey, #consumer{} = Con} ->
+            discard(Meta, MsgIds, ActualConsumerKey, Con, true, #{}, State0);
         _ ->
             {State0, ok}
     end;
@@ -284,13 +303,14 @@ apply(Meta, #modify{consumer_key = ConsumerKey,
                     msg_ids = MsgIds},
       #?STATE{consumers = Cons} = State) ->
     case find_consumer(ConsumerKey, Cons) of
-        {ConsumerKey, #consumer{checked_out = Checked}}
+        {ActualConsumerKey, #consumer{checked_out = Checked}}
           when Undel == false ->
-            return(Meta, ConsumerKey, MsgIds, DelFailed,
+            return(Meta, ActualConsumerKey, MsgIds, DelFailed,
                    Anns, Checked, [], State);
-        {ConsumerKey, #consumer{} = Con}
+        {ActualConsumerKey, #consumer{} = Con}
           when Undel == true ->
-            discard(Meta, MsgIds, ConsumerKey, Con, DelFailed, Anns, State);
+            discard(Meta, MsgIds, ActualConsumerKey,
+                    Con, DelFailed, Anns, State);
         _ ->
             {State, ok}
     end;
@@ -615,16 +635,17 @@ apply(Meta, {nodeup, Node}, #?STATE{consumers = Cons0,
     checkout(Meta, State0, State, Effects);
 apply(_, {nodedown, _Node}, State) ->
     {State, ok};
-apply(#{index := _Idx} = Meta, #purge_nodes{nodes = Nodes}, State0) ->
+apply(Meta, #purge_nodes{nodes = Nodes}, State0) ->
     {State, Effects} = lists:foldl(fun(Node, {S, E}) ->
                                            purge_node(Meta, Node, S, E)
                                    end, {State0, []}, Nodes),
     {State, ok, Effects};
-apply(#{index := _Idx} = Meta,
-      #update_config{config = #{dead_letter_handler := NewDLH} = Conf},
+apply(Meta,
+      #update_config{config = #{} = Conf},
       #?STATE{cfg = #cfg{dead_letter_handler = OldDLH,
                          resource = QRes},
               dlx = DlxState0} = State0) ->
+    NewDLH = maps:get(dead_letter_handler, Conf, OldDLH),
     {DlxState, Effects0} = rabbit_fifo_dlx:update_config(OldDLH, NewDLH, QRes,
                                                          DlxState0),
     State1 = update_config(Conf, State0#?STATE{dlx = DlxState}),
@@ -632,7 +653,7 @@ apply(#{index := _Idx} = Meta,
 apply(Meta, {machine_version, FromVersion, ToVersion}, V0State) ->
     State = convert(Meta, FromVersion, ToVersion, V0State),
     {State, ok, [{aux, {dlx, setup}}]};
-apply(#{index := _IncomingRaftIdx} = Meta, {dlx, _} = Cmd,
+apply(Meta, {dlx, _} = Cmd,
       #?STATE{cfg = #cfg{dead_letter_handler = DLH},
                dlx = DlxState0} = State0) ->
     {DlxState, Effects0} = rabbit_fifo_dlx:apply(Meta, Cmd, DLH, DlxState0),
@@ -890,13 +911,14 @@ get_checked_out(CKey, From, To, #?STATE{consumers = Consumers}) ->
     end.
 
 -spec version() -> pos_integer().
-version() -> 4.
+version() -> 5.
 
 which_module(0) -> rabbit_fifo_v0;
 which_module(1) -> rabbit_fifo_v1;
 which_module(2) -> rabbit_fifo_v3;
 which_module(3) -> rabbit_fifo_v3;
-which_module(4) -> ?MODULE.
+which_module(4) -> ?MODULE;
+which_module(5) -> ?MODULE.
 
 -define(AUX, aux_v3).
 
@@ -1056,7 +1078,7 @@ handle_aux(_RaState, cast, tick, #?AUX{name = Name,
                undefined ->
                    [{release_cursor, ra_aux:last_applied(RaAux)}];
                Smallest ->
-                   [{release_cursor, Smallest}]
+                   [{release_cursor, Smallest - 1}]
            end,
     {no_reply, Aux, RaAux, Effs};
 handle_aux(_RaState, cast, eol, #?AUX{name = Name} = Aux, RaAux) ->
@@ -1905,11 +1927,21 @@ checkout0(_Meta, {_Activity, ExpiredMsg, State0, Effects0}, SendAcc) ->
     Effects = add_delivery_effects(Effects0, SendAcc, State0),
     {State0, ExpiredMsg, lists:reverse(Effects)}.
 
-evaluate_limit(_Index, Result, _BeforeState,
+evaluate_limit(_Index, Result,
+               #?STATE{cfg = #cfg{max_length = undefined,
+                                  max_bytes = undefined}},
                #?STATE{cfg = #cfg{max_length = undefined,
                                   max_bytes = undefined}} = State,
                Effects) ->
     {State, Result, Effects};
+evaluate_limit(_Index, Result, _BeforeState,
+               #?STATE{cfg = #cfg{max_length = undefined,
+                                  max_bytes = undefined},
+                       enqueuers = Enqs0} = State0,
+               Effects0) ->
+    %% max_length and/or max_bytes policies have just been deleted
+    {Enqs, Effects} = unblock_enqueuers(Enqs0, Effects0),
+    {State0#?STATE{enqueuers = Enqs}, Result, Effects};
 evaluate_limit(Index, Result, BeforeState,
                #?STATE{cfg = #cfg{overflow_strategy = Strategy},
                        enqueuers = Enqs0} = State0,
@@ -1939,16 +1971,7 @@ evaluate_limit(Index, Result, BeforeState,
             case {Before, is_below_soft_limit(State0)} of
                 {false, true} ->
                     %% we have moved below the lower limit
-                    {Enqs, Effects} =
-                        maps:fold(
-                          fun (P, #enqueuer{} = E0, {Enqs, Acc})  ->
-                                  E = E0#enqueuer{blocked = undefined},
-                                  {Enqs#{P => E},
-                                   [{send_msg, P, {queue_status, go}, [ra_event]}
-                                    | Acc]};
-                              (_P, _E, Acc) ->
-                                  Acc
-                          end, {Enqs0, Effects0}, Enqs0),
+                    {Enqs, Effects} = unblock_enqueuers(Enqs0, Effects0),
                     {State0#?STATE{enqueuers = Enqs}, Result, Effects};
                 _ ->
                     {State0, Result, Effects0}
@@ -1957,6 +1980,16 @@ evaluate_limit(Index, Result, BeforeState,
             {State0, Result, Effects0}
     end.
 
+unblock_enqueuers(Enqs0, Effects0) ->
+    maps:fold(
+      fun (P, #enqueuer{} = E0, {Enqs, Acc})  ->
+              E = E0#enqueuer{blocked = undefined},
+              {Enqs#{P => E},
+               [{send_msg, P, {queue_status, go}, [ra_event]}
+               | Acc]};
+          (_P, _E, Acc) ->
+              Acc
+      end, {Enqs0, Effects0}, Enqs0).
 
 %% [6,5,4,3,2,1] -> [[1,2],[3,4],[5,6]]
 chunk_disk_msgs([], _Bytes, [[] | Chunks]) ->
@@ -2501,7 +2534,7 @@ make_checkout({_, _} = ConsumerId, Spec0, Meta) ->
 make_settle(ConsumerKey, MsgIds) when is_list(MsgIds) ->
     #settle{consumer_key = ConsumerKey, msg_ids = MsgIds}.
 
--spec make_return(consumer_id(), [msg_id()]) -> protocol().
+-spec make_return(consumer_key(), [msg_id()]) -> protocol().
 make_return(ConsumerKey, MsgIds) ->
     #return{consumer_key = ConsumerKey, msg_ids = MsgIds}.
 
@@ -2509,7 +2542,7 @@ make_return(ConsumerKey, MsgIds) ->
 is_return(Command) ->
     is_record(Command, return).
 
--spec make_discard(consumer_id(), [msg_id()]) -> protocol().
+-spec make_discard(consumer_key(), [msg_id()]) -> protocol().
 make_discard(ConsumerKey, MsgIds) ->
     #discard{consumer_key = ConsumerKey, msg_ids = MsgIds}.
 
@@ -2682,7 +2715,10 @@ convert(Meta, 1, To, State) ->
 convert(Meta, 2, To, State) ->
     convert(Meta, 3, To, rabbit_fifo_v3:convert_v2_to_v3(State));
 convert(Meta, 3, To, State) ->
-    convert(Meta, 4, To, convert_v3_to_v4(Meta, State)).
+    convert(Meta, 4, To, convert_v3_to_v4(Meta, State));
+convert(Meta, 4, To, State) ->
+    %% no conversion needed, this version only includes a logic change
+    convert(Meta, 5, To, State).
 
 smallest_raft_index(#?STATE{messages = Messages,
                             ra_indexes = Indexes,
@@ -2896,7 +2932,10 @@ release_cursor(LastSmallest, Smallest)
   when is_integer(LastSmallest) andalso
        is_integer(Smallest) andalso
        Smallest > LastSmallest ->
-    [{release_cursor, Smallest}];
+    [{release_cursor, Smallest - 1}];
+release_cursor(undefined, Smallest)
+  when is_integer(Smallest) ->
+    [{release_cursor, Smallest - 1}];
 release_cursor(_, _) ->
     [].
 

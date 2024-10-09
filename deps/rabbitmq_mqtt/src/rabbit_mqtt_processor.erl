@@ -391,6 +391,7 @@ process_request(?PUBLISH,
         {ok, Topic, Props, State1} ->
             EffectiveQos = maybe_downgrade_qos(Qos),
             rabbit_global_counters:messages_received(ProtoVer, 1),
+            rabbit_msg_size_metrics:observe(ProtoVer, iolist_size(Payload)),
             State = maybe_increment_publisher(State1),
             Msg = #mqtt_msg{retain = Retain,
                             qos = EffectiveQos,
@@ -769,7 +770,9 @@ handle_clean_start(_, QoS, State = #state{cfg = #cfg{clean_start = true}}) ->
                 ok ->
                     {ok, SessPresent, State};
                 {error, access_refused} ->
-                    {error, ?RC_NOT_AUTHORIZED}
+                    {error, ?RC_NOT_AUTHORIZED};
+                {error, _Reason} ->
+                    {error, ?RC_IMPLEMENTATION_SPECIFIC_ERROR}
             end
     end;
 handle_clean_start(SessPresent, QoS,
@@ -991,7 +994,8 @@ clear_will_msg(#state{cfg = #cfg{vhost = Vhost,
     QName = #resource{virtual_host = Vhost, kind = queue, name = QNameBin},
     case delete_queue(QName, State) of
         ok -> ok;
-        {error, access_refused} -> {error, ?RC_NOT_AUTHORIZED}
+        {error, access_refused} -> {error, ?RC_NOT_AUTHORIZED};
+        {error, _Reason} -> {error, ?RC_IMPLEMENTATION_SPECIFIC_ERROR}
     end.
 
 make_will_msg(#mqtt_packet_connect{will_flag = false}) ->
@@ -1323,8 +1327,10 @@ ensure_queue(QoS, State) ->
             case delete_queue(QName, State) of
                 ok ->
                     create_queue(QoS, State);
-                {error, access_refused} = E ->
-                    E
+                {error, _} = Err ->
+                    Err;
+                {protocol_error, _, _, _} = Err ->
+                    {error, Err}
             end;
         {error, not_found} ->
             create_queue(QoS, State)
@@ -1829,7 +1835,10 @@ maybe_delete_mqtt_qos0_queue(_) ->
     ok.
 
 -spec delete_queue(rabbit_amqqueue:name(), state()) ->
-    ok | {error, access_refused}.
+    ok |
+    {error, access_refused} |
+    {error, timeout} |
+    {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 delete_queue(QName,
              #state{auth_state = #auth_state{
                                     user = User = #user{username = Username},
@@ -1841,8 +1850,12 @@ delete_queue(QName,
       fun (Q) ->
               case check_resource_access(User, QName, configure, AuthzCtx) of
                   ok ->
-                      {ok, _N} = rabbit_queue_type:delete(Q, false, false, Username),
-                      ok;
+                      case rabbit_queue_type:delete(Q, false, false, Username) of
+                          {ok, _} ->
+                              ok;
+                          Err ->
+                              Err
+                      end;
                   Err ->
                       Err
               end
